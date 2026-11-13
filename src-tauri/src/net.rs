@@ -285,6 +285,50 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
         .map_err(|_| "无法创建 HTTP 客户端".to_string())
 }
 
+/// 本地解析并按「IPv4 优先」排序，同时滤掉保留地址与 GFW 污染应答。
+///
+/// 只用于非严格、无代理的分支：有代理时域名交给代理解析，严格模式走
+/// [`network_policy::resolve_target`]，都不该命中这里。
+async fn local_addresses(host: &str, port: u16) -> Vec<SocketAddr> {
+    let Ok(iter) = tokio::net::lookup_host((host, port)).await else {
+        return Vec::new();
+    };
+    let mut v4: Vec<SocketAddr> = Vec::new();
+    let mut v6: Vec<SocketAddr> = Vec::new();
+    for addr in iter {
+        if !network_policy::allowed_ip(addr.ip()) || poisoned(&addr) {
+            continue;
+        }
+        match addr.ip() {
+            std::net::IpAddr::V4(_) => v4.push(addr),
+            std::net::IpAddr::V6(_) => v6.push(addr),
+        }
+    }
+    v4.sort_unstable();
+    v4.dedup();
+    v6.sort_unstable();
+    v6.dedup();
+    // IPv4 在前：hyper 按顺序尝试，先命中真实地址就不会被污染的 IPv6 拖慢或打断。
+    v4.extend(v6);
+    v4.truncate(8);
+    v4
+}
+
+/// 是否属于 GFW 注入的污染地址：Facebook 的 `2a03:2880::/32`、`157.240.0.0/16`，
+/// 以及带 `face:b00c` 标记的 IPv6。上游站点不可能落在这些段里。
+fn poisoned(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V6(ip) => {
+            let s = ip.segments();
+            (s[0] == 0x2a03 && s[1] == 0x2880) || (s[4] == 0xface && s[5] == 0xb00c)
+        }
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            a == 157 && b == 240
+        }
+    }
+}
+
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -337,7 +381,24 @@ async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<re
     } else if strict {
         (network_policy::resolve_target(&target, strict).await?, CLIENT_TTL)
     } else {
-        (Vec::new(), CLIENT_TTL)
+        // 非严格模式、无代理：以前把域名整个交给 getaddrinfo。Android 的系统解析器按
+        // RFC 6724 会先给出 IPv6，而国内网络的 AAAA 常被污染成 `2a03:2880:…:face:b00c`
+        // （Facebook 段），连接直接被拒 ⇒「浏览器能开、APP 首页加载失败」。
+        // 这里自己解析一次：滤掉污染与保留地址，IPv4 排在前面先试。
+        let mut addrs = local_addresses(host, port).await;
+        if addrs.is_empty() {
+            // 系统解析没给出可用地址，退到内置 DoH 再要一次。
+            if let Ok(resolver) =
+                build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)
+            {
+                if let Ok(resolution) =
+                    crate::media_dns::resolve(&resolver, host, port).await
+                {
+                    addrs = resolution.addresses;
+                }
+            }
+        }
+        (addrs, CLIENT_TTL)
     };
     let http = Arc::new(build_client(host, &addrs)?);
     let now = Instant::now();
